@@ -15,10 +15,19 @@ def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
         log.info("DOUYIN_COOKIES_B64 not set — yt-dlp will run without cookies")
         return None
 
+    cleaned = "".join(b64_content.split())
+    padding = (-len(cleaned)) % 4
+    if padding:
+        cleaned += "=" * padding
+
     try:
-        decoded = base64.b64decode(b64_content).decode("utf-8")
+        decoded = base64.b64decode(cleaned, validate=False).decode("utf-8")
     except Exception as exc:
-        log.error("Failed to decode DOUYIN_COOKIES_B64: %s", exc)
+        log.error(
+            "Failed to decode DOUYIN_COOKIES_B64 (len=%d): %s",
+            len(cleaned),
+            exc,
+        )
         return None
 
     Path(target_path).parent.mkdir(parents=True, exist_ok=True)
