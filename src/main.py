@@ -34,16 +34,36 @@ def _prepare_filesystem() -> None:
     log.info("Prepared download dir: %s", download_dir)
 
 
+async def _connect_redis_with_retry(url: str) -> redis.Redis:
+    """Railway boots services in parallel — Redis DNS có thể chưa sẵn sàng
+    khi bot start. Retry với exponential backoff."""
+    delays = [2, 4, 8, 16, 30]
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            client: redis.Redis = redis.from_url(url, decode_responses=True)
+            await client.ping()
+            log.info("Connected to Redis (attempt %d)", attempt)
+            return client
+        except Exception as exc:
+            last_exc = exc
+            log.warning(
+                "Redis connect failed (attempt %d/%d): %s — retry sau %ds",
+                attempt,
+                len(delays),
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"Redis unreachable sau {len(delays)} lần thử: {last_exc}")
+
+
 async def _run() -> None:
     _configure_logging()
     _prepare_filesystem()
     write_cookies_from_env(settings.douyin_cookies_b64, settings.cookies_path)
 
-    redis_client: redis.Redis = redis.from_url(
-        settings.redis_url, decode_responses=True
-    )
-    await redis_client.ping()
-    log.info("Connected to Redis")
+    redis_client = await _connect_redis_with_retry(settings.redis_url)
 
     cache = FileCache(redis_client, ttl=settings.cache_ttl)
     limiter = RateLimiter(
