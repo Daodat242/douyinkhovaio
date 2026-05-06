@@ -85,6 +85,11 @@ async def _run() -> None:
     me = await bot.get_me()
     log.info("Bot @%s started (id=%s)", me.username, me.id)
 
+    webhook_info = await bot.get_webhook_info()
+    if webhook_info.url:
+        log.info("Removing existing webhook: %s", webhook_info.url)
+    await bot.delete_webhook(drop_pending_updates=True)
+
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
