@@ -51,9 +51,9 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
         )
         return
 
-    cached = await cache.get(parsed.raw)
+    cached = await cache.get(parsed.canonical)
     if cached:
-        log.info("cache hit user=%s url=%s", user_id, parsed.raw)
+        log.info("cache hit user=%s url=%s", user_id, parsed.canonical)
         await message.reply_video(
             video=cached.file_id,
             caption=_format_caption(cached.title, cached.uploader),
@@ -64,7 +64,7 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
 
     try:
         result = await downloader.download(
-            parsed.raw,
+            parsed.canonical,
             Path(settings.download_dir),
             settings.cookies_path,
             settings.max_filesize_mb,
@@ -76,14 +76,14 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
         )
         return
     except downloader.DownloadError as exc:
-        log.warning("download failed url=%s err=%s", parsed.raw, exc)
+        log.warning("download failed url=%s err=%s", parsed.canonical, exc)
         await status.edit_text(
             "❌ Không tải được video. Có thể link đã hết hạn, video bị xoá, "
             "hoặc Douyin chặn. Thử lại sau hoặc gửi link khác."
         )
         return
     except Exception as exc:
-        log.exception("unexpected error url=%s", parsed.raw)
+        log.exception("unexpected error url=%s", parsed.canonical)
         await status.edit_text(f"💥 Lỗi không mong muốn: {exc}")
         return
 
@@ -98,7 +98,7 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
 
         if sent.video:
             await cache.set(
-                parsed.raw,
+                parsed.canonical,
                 CachedFile(
                     file_id=sent.video.file_id,
                     title=result.info.title,
