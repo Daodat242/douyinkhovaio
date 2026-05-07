@@ -77,10 +77,20 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
         return
     except downloader.DownloadError as exc:
         log.warning("download failed url=%s err=%s", parsed.canonical, exc)
-        await status.edit_text(
-            "❌ Không tải được video. Có thể link đã hết hạn, video bị xoá, "
-            "hoặc Douyin chặn. Thử lại sau hoặc gửi link khác."
-        )
+        err_text = str(exc).lower()
+        if "fresh cookies" in err_text or "login" in err_text:
+            reply = (
+                "🍪 Douyin đang chặn (cookies cần refresh hoặc IP server bị khoá). "
+                "Admin đang xử lý — thử lại sau, hoặc gửi link TikTok thay thế."
+            )
+        elif "private" in err_text or "unavailable" in err_text:
+            reply = "🔒 Video riêng tư hoặc đã bị xoá."
+        else:
+            reply = (
+                "❌ Không tải được video. Có thể link đã hết hạn, video bị xoá, "
+                "hoặc Douyin chặn. Thử lại sau hoặc gửi link khác."
+            )
+        await status.edit_text(reply)
         return
     except Exception as exc:
         log.exception("unexpected error url=%s", parsed.canonical)

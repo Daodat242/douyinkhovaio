@@ -10,6 +10,17 @@ import yt_dlp
 
 log = logging.getLogger(__name__)
 
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+
+    _IMPERSONATE_TARGET: object | None = ImpersonateTarget.from_str("chrome")
+except Exception as _impersonate_exc:
+    log.warning(
+        "yt-dlp impersonate target unavailable (%s) — TLS fingerprint sẽ là default",
+        _impersonate_exc,
+    )
+    _IMPERSONATE_TARGET = None
+
 
 class DownloadError(Exception):
     pass
@@ -45,10 +56,16 @@ _DEFAULT_HEADERS = {
         "Chrome/139.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.douyin.com/",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+# iesdouyin.com là API legacy, anti-bot lỏng hơn so với www.douyin.com.
+_DOUYIN_EXTRACTOR_ARGS = {
+    "douyin": {"api_hostname": ["www.iesdouyin.com"]},
 }
 
 
-def _base_opts(cookies_path: str | None) -> dict:
+def _base_opts(cookies_path: str | None, *, impersonate: bool = True) -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -57,7 +74,10 @@ def _base_opts(cookies_path: str | None) -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "extractor_args": _DOUYIN_EXTRACTOR_ARGS,
     }
+    if impersonate and _IMPERSONATE_TARGET is not None:
+        opts["impersonate"] = _IMPERSONATE_TARGET
     if cookies_path and os.path.exists(cookies_path):
         opts["cookiefile"] = cookies_path
     return opts
@@ -98,10 +118,16 @@ def _download_sync(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     opts = _base_opts(cookies_path)
+    # Douyin thường không gắn filesize vào format metadata → filter "filesize<N"
+    # sẽ loại hết format. Dùng filesize_approx (luôn có), fallback "best".
     opts.update(
         {
             "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
-            "format": f"best[filesize<{max_filesize_mb}M]/best",
+            "format": (
+                f"best[filesize_approx<?{max_filesize_mb}M]"
+                f"/best[filesize<?{max_filesize_mb}M]"
+                f"/best"
+            ),
             "noplaylist": True,
             "merge_output_format": "mp4",
         }

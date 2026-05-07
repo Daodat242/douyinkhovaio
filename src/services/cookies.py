@@ -1,9 +1,61 @@
 import base64
 import logging
 import os
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Douyin extractor của yt-dlp kiểm tra các cookie này. Hết hạn → "Fresh
+# cookies needed" error.
+_CRITICAL_DOUYIN_COOKIES = ("sessionid", "ttwid", "passport_csrf_token")
+
+
+def _check_cookie_freshness(cookie_text: str) -> None:
+    """Parse Netscape cookie file, log warning nếu cookies quan trọng đã hết
+    hạn hoặc sắp hết hạn (< 24h). Giúp phân biệt lỗi cookies expired vs
+    anti-bot block khi debug."""
+    now = int(time.time())
+    found: dict[str, int] = {}
+
+    for line in cookie_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("\t")
+        if len(parts) < 7:
+            continue
+        try:
+            expiry = int(parts[4])
+        except ValueError:
+            continue
+        name = parts[5]
+        if name in _CRITICAL_DOUYIN_COOKIES:
+            found[name] = expiry
+
+    for name in _CRITICAL_DOUYIN_COOKIES:
+        if name not in found:
+            log.warning("Cookie '%s' không có trong file — Douyin có thể từ chối", name)
+            continue
+        expiry = found[name]
+        if expiry == 0:
+            log.info("Cookie '%s' là session cookie (no expiry)", name)
+            continue
+        remaining = expiry - now
+        if remaining <= 0:
+            log.error(
+                "Cookie '%s' ĐÃ HẾT HẠN %d giờ trước — export lại từ browser",
+                name,
+                -remaining // 3600,
+            )
+        elif remaining < 86400:
+            log.warning(
+                "Cookie '%s' sắp hết hạn (%d giờ nữa)",
+                name,
+                remaining // 3600,
+            )
+        else:
+            log.info("Cookie '%s' còn hạn %d ngày", name, remaining // 86400)
 
 
 def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
@@ -58,4 +110,5 @@ def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
         target_path,
         len(text.encode("utf-8")),
     )
+    _check_cookie_freshness(text)
     return target_path
