@@ -34,11 +34,15 @@ _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _PATTERNS: list[tuple[re.Pattern[str], UrlKind]] = [
     (re.compile(r"^https?://v\.douyin\.com/[\w-]+/?", re.IGNORECASE), UrlKind.DOUYIN_VIDEO),
     (
-        re.compile(r"^https?://(?:www\.)?douyin\.com/(?:video|share/video)/\d+", re.IGNORECASE),
+        re.compile(r"^https?://(?:www\.)?douyin\.com/(?:video|share/video|note)/\d+", re.IGNORECASE),
         UrlKind.DOUYIN_VIDEO,
     ),
     (
-        re.compile(r"^https?://(?:www\.)?iesdouyin\.com/share/video/\d+", re.IGNORECASE),
+        re.compile(r"^https?://(?:www\.)?douyin\.com/[\w-]*\?[^#]*\bmodal_id=\d+", re.IGNORECASE),
+        UrlKind.DOUYIN_VIDEO,
+    ),
+    (
+        re.compile(r"^https?://(?:www\.)?iesdouyin\.com/share/(?:video|note)/\d+", re.IGNORECASE),
         UrlKind.DOUYIN_VIDEO,
     ),
     (
