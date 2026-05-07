@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import shutil
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -63,8 +65,16 @@ def _build_opener(proxy_url: str | None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
+def _is_rate_limit_message(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return any(kw in msg_lower for kw in ("rate limit", "limit", "free api", "too many"))
+
+
 def _tikwm_query(url: str, proxy_url: str | None) -> dict:
-    """Gọi tikwm API, trả về dict 'data' từ response."""
+    """Gọi tikwm API, trả về dict 'data' từ response.
+
+    Retry tối đa 2 lần khi rate limit (free tier ~1 req/s).
+    """
     params = urllib.parse.urlencode({"url": url, "hd": "1"})
     full_url = f"{_TIKWM_ENDPOINT}?{params}"
     req = urllib.request.Request(
@@ -72,27 +82,42 @@ def _tikwm_query(url: str, proxy_url: str | None) -> dict:
         headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
     )
     opener = _build_opener(proxy_url)
-    try:
-        with opener.open(req, timeout=_REQUEST_TIMEOUT) as resp:
-            body = resp.read().decode("utf-8")
-    except Exception as exc:
-        raise DownloadError(f"tikwm request failed: {exc}") from exc
 
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise DownloadError(f"tikwm returned non-JSON: {body[:200]}") from exc
+    last_error_msg = ""
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(1.5)
+        try:
+            with opener.open(req, timeout=_REQUEST_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < 2:
+                last_error_msg = "HTTP 429 rate limit"
+                continue
+            raise DownloadError(f"tikwm HTTP {exc.code}: {exc.reason}") from exc
+        except Exception as exc:
+            raise DownloadError(f"tikwm request failed: {exc}") from exc
 
-    if payload.get("code") != 0:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise DownloadError(f"tikwm returned non-JSON: {body[:200]}") from exc
+
+        if payload.get("code") == 0:
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise DownloadError("tikwm response missing 'data'")
+            return data
+
         msg = payload.get("msg") or "unknown tikwm error"
-        # Tikwm trả về "Url parsing is failed" nếu video private/đã xoá,
-        # "rate limit" nếu vượt 1 req/s.
+        # "Url parsing is failed" → video private/đã xoá. Không retry.
+        # "Free Api Limit" / rate limit → retry.
+        if _is_rate_limit_message(msg) and attempt < 2:
+            last_error_msg = msg
+            continue
         raise DownloadError(f"tikwm: {msg}")
 
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        raise DownloadError("tikwm response missing 'data'")
-    return data
+    raise DownloadError(f"tikwm: rate limited sau 3 lần thử ({last_error_msg})")
 
 
 def _http_download(video_url: str, dest: Path, proxy_url: str | None) -> None:
