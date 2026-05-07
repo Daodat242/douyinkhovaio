@@ -66,7 +66,6 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
         result = await downloader.download(
             parsed.canonical,
             Path(settings.download_dir),
-            settings.cookies_path,
             settings.max_filesize_mb,
             settings.proxy_url or None,
         )
@@ -79,17 +78,14 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
     except downloader.DownloadError as exc:
         log.warning("download failed url=%s err=%s", parsed.canonical, exc)
         err_text = str(exc).lower()
-        if "fresh cookies" in err_text or "login" in err_text:
-            reply = (
-                "🍪 Douyin đang chặn (cookies cần refresh hoặc IP server bị khoá). "
-                "Admin đang xử lý — thử lại sau, hoặc gửi link TikTok thay thế."
-            )
-        elif "private" in err_text or "unavailable" in err_text:
-            reply = "🔒 Video riêng tư hoặc đã bị xoá."
+        if "rate limit" in err_text or "too many" in err_text:
+            reply = "⏳ Service đang quá tải (rate limit). Thử lại sau ít giây."
+        elif "url parsing" in err_text or "private" in err_text or "not found" in err_text:
+            reply = "🔒 Video riêng tư, đã xoá, hoặc link không hợp lệ."
         else:
             reply = (
-                "❌ Không tải được video. Có thể link đã hết hạn, video bị xoá, "
-                "hoặc Douyin chặn. Thử lại sau hoặc gửi link khác."
+                "❌ Không tải được video. Thử lại sau hoặc gửi link khác. "
+                "Service tikwm có thể đang gặp sự cố."
             )
         await status.edit_text(reply)
         return

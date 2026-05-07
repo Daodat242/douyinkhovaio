@@ -12,7 +12,6 @@ from src.config import settings
 from src.handlers import start as start_handler
 from src.handlers import video as video_handler
 from src.services.cache import FileCache
-from src.services.cookies import write_cookies_from_env
 from src.services.ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
@@ -70,12 +69,9 @@ async def _connect_redis_with_retry(url: str) -> redis.Redis:
 async def _run() -> None:
     _configure_logging()
     _prepare_filesystem()
-    write_cookies_from_env(settings.douyin_cookies_b64, settings.cookies_path)
 
     if settings.proxy_url:
-        log.info("Using proxy for yt-dlp requests: %s", _redact_proxy(settings.proxy_url))
-    else:
-        log.info("No PROXY_URL set — yt-dlp sẽ dùng IP của Railway (có thể bị Douyin chặn)")
+        log.info("Routing tikwm requests via proxy: %s", _redact_proxy(settings.proxy_url))
 
     redis_client = await _connect_redis_with_retry(settings.redis_url)
 

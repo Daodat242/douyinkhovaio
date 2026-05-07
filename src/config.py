@@ -20,9 +20,7 @@ class Settings:
     api_hash: str
     redis_url: str
     admin_user_id: int
-    douyin_cookies_b64: str
     download_dir: str
-    cookies_path: str
     rate_limit_count: int
     rate_limit_window: int
     max_filesize_mb: int
@@ -39,9 +37,7 @@ def load_settings() -> Settings:
         api_hash=_get("API_HASH", ""),
         redis_url=_get("REDIS_URL", required=True),
         admin_user_id=int(_get("ADMIN_USER_ID", "0")),
-        douyin_cookies_b64=_get("DOUYIN_COOKIES_B64", ""),
         download_dir=_get("DOWNLOAD_DIR", "/tmp/dl"),
-        cookies_path=_get("COOKIES_PATH", "/tmp/cookies.txt"),
         rate_limit_count=int(_get("RATE_LIMIT_COUNT", "10")),
         rate_limit_window=int(_get("RATE_LIMIT_WINDOW", "600")),
         max_filesize_mb=int(_get("MAX_FILESIZE_MB", "50")),

@@ -1,28 +1,20 @@
+"""Video downloader sử dụng tikwm.com API.
+
+Hỗ trợ Douyin và TikTok không watermark, không cần cookies hoặc xử lý
+anti-bot. Đánh đổi: phụ thuộc service bên ngoài (~1 req/s rate limit).
+"""
+
 import asyncio
+import json
 import logging
-import os
 import shutil
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-import yt_dlp
-
 log = logging.getLogger(__name__)
-
-try:
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-
-    _IMPERSONATE_TARGET: object | None = ImpersonateTarget.from_str("chrome")
-except Exception as _impersonate_exc:
-    log.warning(
-        "yt-dlp impersonate target unavailable (%s) — TLS fingerprint sẽ là default",
-        _impersonate_exc,
-    )
-    _IMPERSONATE_TARGET = None
-
-# Được đặt thành False khi runtime phát hiện curl_cffi không hỗ trợ target.
-_impersonate_enabled = _IMPERSONATE_TARGET is not None
 
 
 class DownloadError(Exception):
@@ -52,165 +44,127 @@ class DownloadResult:
     info: VideoInfo
 
 
-_DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/139.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.douyin.com/",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
-
-# iesdouyin.com là API legacy, anti-bot lỏng hơn so với www.douyin.com.
-_DOUYIN_EXTRACTOR_ARGS = {
-    "douyin": {"api_hostname": ["www.iesdouyin.com"]},
-}
+_TIKWM_ENDPOINT = "https://www.tikwm.com/api/"
+_REQUEST_TIMEOUT = 30
+_DOWNLOAD_TIMEOUT = 120
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
+)
 
 
-def _base_opts(
-    cookies_path: str | None,
-    *,
-    impersonate: bool = True,
-    proxy_url: str | None = None,
-) -> dict:
-    opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "http_headers": _DEFAULT_HEADERS,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "extractor_args": _DOUYIN_EXTRACTOR_ARGS,
-    }
-    if impersonate and _impersonate_enabled and _IMPERSONATE_TARGET is not None:
-        opts["impersonate"] = _IMPERSONATE_TARGET
-    if cookies_path and os.path.exists(cookies_path):
-        opts["cookiefile"] = cookies_path
+def _build_opener(proxy_url: str | None) -> urllib.request.OpenerDirector:
+    handlers: list = []
     if proxy_url:
-        opts["proxy"] = proxy_url
-    return opts
+        handlers.append(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    return urllib.request.build_opener(*handlers)
 
 
-def _probe(url: str, cookies_path: str | None, proxy_url: str | None = None) -> dict:
-    opts = _base_opts(cookies_path, proxy_url=proxy_url)
-    opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def _to_video_info(url: str, info: dict) -> VideoInfo:
-    filesize = info.get("filesize") or info.get("filesize_approx")
-    return VideoInfo(
-        url=url,
-        title=(info.get("title") or "video").strip()[:200],
-        uploader=info.get("uploader") or info.get("uploader_id") or "unknown",
-        duration=int(info.get("duration") or 0),
-        filesize_mb=(filesize / 1024 / 1024) if filesize else None,
-        thumbnail=info.get("thumbnail"),
+def _tikwm_query(url: str, proxy_url: str | None) -> dict:
+    """Gọi tikwm API, trả về dict 'data' từ response."""
+    params = urllib.parse.urlencode({"url": url, "hd": "1"})
+    full_url = f"{_TIKWM_ENDPOINT}?{params}"
+    req = urllib.request.Request(
+        full_url,
+        headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
     )
+    opener = _build_opener(proxy_url)
+    try:
+        with opener.open(req, timeout=_REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+    except Exception as exc:
+        raise DownloadError(f"tikwm request failed: {exc}") from exc
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise DownloadError(f"tikwm returned non-JSON: {body[:200]}") from exc
+
+    if payload.get("code") != 0:
+        msg = payload.get("msg") or "unknown tikwm error"
+        # Tikwm trả về "Url parsing is failed" nếu video private/đã xoá,
+        # "rate limit" nếu vượt 1 req/s.
+        raise DownloadError(f"tikwm: {msg}")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise DownloadError("tikwm response missing 'data'")
+    return data
 
 
-async def probe(
-    url: str, cookies_path: str | None, proxy_url: str | None = None
-) -> VideoInfo:
-    info = await asyncio.to_thread(_probe, url, cookies_path, proxy_url)
-    return _to_video_info(url, info)
-
-
-def _run_ydl(url: str, job_dir: Path, opts: dict) -> tuple[dict, Path]:
-    """Chạy yt-dlp, trả về (info, filepath). Raise nếu fail."""
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filepath = Path(ydl.prepare_filename(info))
-        if not filepath.exists():
-            candidates = list(job_dir.iterdir())
-            if not candidates:
-                raise DownloadError("yt-dlp ran but no file produced")
-            filepath = max(candidates, key=lambda p: p.stat().st_size)
-    return info, filepath
+def _http_download(video_url: str, dest: Path, proxy_url: str | None) -> None:
+    req = urllib.request.Request(video_url, headers={"User-Agent": _USER_AGENT})
+    opener = _build_opener(proxy_url)
+    try:
+        with opener.open(req, timeout=_DOWNLOAD_TIMEOUT) as resp:
+            with dest.open("wb") as f:
+                shutil.copyfileobj(resp, f, length=64 * 1024)
+    except Exception as exc:
+        raise DownloadError(f"video download failed: {exc}") from exc
 
 
 def _download_sync(
     url: str,
     download_dir: Path,
-    cookies_path: str | None,
     max_filesize_mb: int,
-    proxy_url: str | None = None,
+    proxy_url: str | None,
 ) -> DownloadResult:
-    global _impersonate_enabled
+    info = _tikwm_query(url, proxy_url)
+
+    # hdplay = HD không watermark, play = SD không watermark.
+    video_url = info.get("hdplay") or info.get("play")
+    if not video_url:
+        raise DownloadError("tikwm: response không có video URL")
+
+    declared_size_bytes = info.get("size") or info.get("hd_size")
+    if declared_size_bytes:
+        declared_mb = declared_size_bytes / 1024 / 1024
+        if declared_mb > max_filesize_mb:
+            raise TooLargeError(declared_mb, max_filesize_mb)
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = download_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    extra = {
-        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
-        # Douyin thường không có filesize chính xác → dùng filesize_approx,
-        # fallback "best" để không bị loại hết format.
-        "format": (
-            f"best[filesize_approx<?{max_filesize_mb}M]"
-            f"/best[filesize<?{max_filesize_mb}M]"
-            f"/best"
-        ),
-        "noplaylist": True,
-        "merge_output_format": "mp4",
-    }
+    video_id = str(info.get("id") or job_id)
+    filepath = job_dir / f"{video_id}.mp4"
 
     try:
-        opts = _base_opts(cookies_path, impersonate=True, proxy_url=proxy_url)
-        opts.update(extra)
-        info, filepath = _run_ydl(url, job_dir, opts)
-    except Exception as exc:
-        err_str = str(exc)
-        # curl_cffi không support target này trên môi trường hiện tại →
-        # tắt impersonation và retry ngay, không fail toàn bộ request.
-        if _impersonate_enabled and "impersonate" in err_str.lower():
-            log.warning("Impersonation unavailable on this host, disabling: %s", exc)
-            _impersonate_enabled = False
-            try:
-                opts = _base_opts(cookies_path, impersonate=False, proxy_url=proxy_url)
-                opts.update(extra)
-                info, filepath = _run_ydl(url, job_dir, opts)
-            except yt_dlp.utils.DownloadError as exc2:
-                shutil.rmtree(job_dir, ignore_errors=True)
-                raise DownloadError(str(exc2)) from exc2
-            except Exception:
-                shutil.rmtree(job_dir, ignore_errors=True)
-                raise
-        elif isinstance(exc, yt_dlp.utils.DownloadError):
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise DownloadError(str(exc)) from exc
-        else:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise
+        _http_download(video_url, filepath, proxy_url)
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
     size_mb = filepath.stat().st_size / 1024 / 1024
     if size_mb > max_filesize_mb:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise TooLargeError(size_mb, max_filesize_mb)
 
-    video_info = _to_video_info(url, info)
-    if video_info.filesize_mb is None:
-        video_info = VideoInfo(**{**video_info.__dict__, "filesize_mb": size_mb})
+    author = info.get("author") or {}
+    video_info = VideoInfo(
+        url=url,
+        title=(info.get("title") or "video").strip()[:200],
+        uploader=(
+            author.get("nickname") or author.get("unique_id") or "unknown"
+        ),
+        duration=int(info.get("duration") or 0),
+        filesize_mb=size_mb,
+        thumbnail=info.get("cover") or info.get("origin_cover"),
+    )
     return DownloadResult(filepath=filepath, info=video_info)
 
 
 async def download(
     url: str,
     download_dir: Path,
-    cookies_path: str | None,
     max_filesize_mb: int,
     proxy_url: str | None = None,
 ) -> DownloadResult:
     return await asyncio.to_thread(
-        _download_sync,
-        url,
-        download_dir,
-        cookies_path,
-        max_filesize_mb,
-        proxy_url,
+        _download_sync, url, download_dir, max_filesize_mb, proxy_url
     )
 
 
