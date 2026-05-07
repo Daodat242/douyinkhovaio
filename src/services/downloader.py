@@ -21,6 +21,9 @@ except Exception as _impersonate_exc:
     )
     _IMPERSONATE_TARGET = None
 
+# Được đặt thành False khi runtime phát hiện curl_cffi không hỗ trợ target.
+_impersonate_enabled = _IMPERSONATE_TARGET is not None
+
 
 class DownloadError(Exception):
     pass
@@ -76,7 +79,7 @@ def _base_opts(cookies_path: str | None, *, impersonate: bool = True) -> dict:
         "socket_timeout": 30,
         "extractor_args": _DOUYIN_EXTRACTOR_ARGS,
     }
-    if impersonate and _IMPERSONATE_TARGET is not None:
+    if impersonate and _impersonate_enabled and _IMPERSONATE_TARGET is not None:
         opts["impersonate"] = _IMPERSONATE_TARGET
     if cookies_path and os.path.exists(cookies_path):
         opts["cookiefile"] = cookies_path
@@ -107,48 +110,71 @@ async def probe(url: str, cookies_path: str | None) -> VideoInfo:
     return _to_video_info(url, info)
 
 
+def _run_ydl(url: str, job_dir: Path, opts: dict) -> tuple[dict, Path]:
+    """Chạy yt-dlp, trả về (info, filepath). Raise nếu fail."""
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filepath = Path(ydl.prepare_filename(info))
+        if not filepath.exists():
+            candidates = list(job_dir.iterdir())
+            if not candidates:
+                raise DownloadError("yt-dlp ran but no file produced")
+            filepath = max(candidates, key=lambda p: p.stat().st_size)
+    return info, filepath
+
+
 def _download_sync(
     url: str,
     download_dir: Path,
     cookies_path: str | None,
     max_filesize_mb: int,
 ) -> DownloadResult:
+    global _impersonate_enabled
+
     job_id = uuid.uuid4().hex[:12]
     job_dir = download_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    opts = _base_opts(cookies_path)
-    # Douyin thường không gắn filesize vào format metadata → filter "filesize<N"
-    # sẽ loại hết format. Dùng filesize_approx (luôn có), fallback "best".
-    opts.update(
-        {
-            "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
-            "format": (
-                f"best[filesize_approx<?{max_filesize_mb}M]"
-                f"/best[filesize<?{max_filesize_mb}M]"
-                f"/best"
-            ),
-            "noplaylist": True,
-            "merge_output_format": "mp4",
-        }
-    )
+    extra = {
+        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
+        # Douyin thường không có filesize chính xác → dùng filesize_approx,
+        # fallback "best" để không bị loại hết format.
+        "format": (
+            f"best[filesize_approx<?{max_filesize_mb}M]"
+            f"/best[filesize<?{max_filesize_mb}M]"
+            f"/best"
+        ),
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+    }
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = Path(ydl.prepare_filename(info))
-            if not filepath.exists():
-                # yt-dlp có thể đổi extension sau merge → tìm file thực tế trong job_dir
-                candidates = list(job_dir.iterdir())
-                if not candidates:
-                    raise DownloadError("yt-dlp ran but no file produced")
-                filepath = max(candidates, key=lambda p: p.stat().st_size)
-    except yt_dlp.utils.DownloadError as exc:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise DownloadError(str(exc)) from exc
-    except Exception:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise
+        opts = _base_opts(cookies_path, impersonate=True)
+        opts.update(extra)
+        info, filepath = _run_ydl(url, job_dir, opts)
+    except Exception as exc:
+        err_str = str(exc)
+        # curl_cffi không support target này trên môi trường hiện tại →
+        # tắt impersonation và retry ngay, không fail toàn bộ request.
+        if _impersonate_enabled and "impersonate" in err_str.lower():
+            log.warning("Impersonation unavailable on this host, disabling: %s", exc)
+            _impersonate_enabled = False
+            try:
+                opts = _base_opts(cookies_path, impersonate=False)
+                opts.update(extra)
+                info, filepath = _run_ydl(url, job_dir, opts)
+            except yt_dlp.utils.DownloadError as exc2:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise DownloadError(str(exc2)) from exc2
+            except Exception:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise
+        elif isinstance(exc, yt_dlp.utils.DownloadError):
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise DownloadError(str(exc)) from exc
+        else:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
 
     size_mb = filepath.stat().st_size / 1024 / 1024
     if size_mb > max_filesize_mb:
