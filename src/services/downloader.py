@@ -68,7 +68,12 @@ _DOUYIN_EXTRACTOR_ARGS = {
 }
 
 
-def _base_opts(cookies_path: str | None, *, impersonate: bool = True) -> dict:
+def _base_opts(
+    cookies_path: str | None,
+    *,
+    impersonate: bool = True,
+    proxy_url: str | None = None,
+) -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -83,11 +88,13 @@ def _base_opts(cookies_path: str | None, *, impersonate: bool = True) -> dict:
         opts["impersonate"] = _IMPERSONATE_TARGET
     if cookies_path and os.path.exists(cookies_path):
         opts["cookiefile"] = cookies_path
+    if proxy_url:
+        opts["proxy"] = proxy_url
     return opts
 
 
-def _probe(url: str, cookies_path: str | None) -> dict:
-    opts = _base_opts(cookies_path)
+def _probe(url: str, cookies_path: str | None, proxy_url: str | None = None) -> dict:
+    opts = _base_opts(cookies_path, proxy_url=proxy_url)
     opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -105,8 +112,10 @@ def _to_video_info(url: str, info: dict) -> VideoInfo:
     )
 
 
-async def probe(url: str, cookies_path: str | None) -> VideoInfo:
-    info = await asyncio.to_thread(_probe, url, cookies_path)
+async def probe(
+    url: str, cookies_path: str | None, proxy_url: str | None = None
+) -> VideoInfo:
+    info = await asyncio.to_thread(_probe, url, cookies_path, proxy_url)
     return _to_video_info(url, info)
 
 
@@ -128,6 +137,7 @@ def _download_sync(
     download_dir: Path,
     cookies_path: str | None,
     max_filesize_mb: int,
+    proxy_url: str | None = None,
 ) -> DownloadResult:
     global _impersonate_enabled
 
@@ -149,7 +159,7 @@ def _download_sync(
     }
 
     try:
-        opts = _base_opts(cookies_path, impersonate=True)
+        opts = _base_opts(cookies_path, impersonate=True, proxy_url=proxy_url)
         opts.update(extra)
         info, filepath = _run_ydl(url, job_dir, opts)
     except Exception as exc:
@@ -160,7 +170,7 @@ def _download_sync(
             log.warning("Impersonation unavailable on this host, disabling: %s", exc)
             _impersonate_enabled = False
             try:
-                opts = _base_opts(cookies_path, impersonate=False)
+                opts = _base_opts(cookies_path, impersonate=False, proxy_url=proxy_url)
                 opts.update(extra)
                 info, filepath = _run_ydl(url, job_dir, opts)
             except yt_dlp.utils.DownloadError as exc2:
@@ -192,9 +202,15 @@ async def download(
     download_dir: Path,
     cookies_path: str | None,
     max_filesize_mb: int,
+    proxy_url: str | None = None,
 ) -> DownloadResult:
     return await asyncio.to_thread(
-        _download_sync, url, download_dir, cookies_path, max_filesize_mb
+        _download_sync,
+        url,
+        download_dir,
+        cookies_path,
+        max_filesize_mb,
+        proxy_url,
     )
 
 

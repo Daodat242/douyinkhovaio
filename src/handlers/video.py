@@ -68,6 +68,7 @@ async def on_url(message: Message, cache: FileCache, limiter: RateLimiter) -> No
             Path(settings.download_dir),
             settings.cookies_path,
             settings.max_filesize_mb,
+            settings.proxy_url or None,
         )
     except downloader.TooLargeError as exc:
         await status.edit_text(

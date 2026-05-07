@@ -34,6 +34,15 @@ def _prepare_filesystem() -> None:
     log.info("Prepared download dir: %s", download_dir)
 
 
+def _redact_proxy(url: str) -> str:
+    """Ẩn user:pass trong proxy URL khi log."""
+    if "@" in url:
+        scheme_split = url.split("://", 1)
+        if len(scheme_split) == 2 and "@" in scheme_split[1]:
+            return f"{scheme_split[0]}://***@{scheme_split[1].split('@', 1)[1]}"
+    return url
+
+
 async def _connect_redis_with_retry(url: str) -> redis.Redis:
     """Railway boots services in parallel — Redis DNS có thể chưa sẵn sàng
     khi bot start. Retry với exponential backoff."""
@@ -62,6 +71,11 @@ async def _run() -> None:
     _configure_logging()
     _prepare_filesystem()
     write_cookies_from_env(settings.douyin_cookies_b64, settings.cookies_path)
+
+    if settings.proxy_url:
+        log.info("Using proxy for yt-dlp requests: %s", _redact_proxy(settings.proxy_url))
+    else:
+        log.info("No PROXY_URL set — yt-dlp sẽ dùng IP của Railway (có thể bị Douyin chặn)")
 
     redis_client = await _connect_redis_with_retry(settings.redis_url)
 

@@ -29,6 +29,7 @@ class Settings:
     cache_ttl: int
     channel_default_limit: int
     channel_max_limit: int
+    proxy_url: str
 
 
 def load_settings() -> Settings:
@@ -47,6 +48,7 @@ def load_settings() -> Settings:
         cache_ttl=int(_get("CACHE_TTL", "2592000")),
         channel_default_limit=int(_get("CHANNEL_DEFAULT_LIMIT", "20")),
         channel_max_limit=int(_get("CHANNEL_MAX_LIMIT", "50")),
+        proxy_url=_get("PROXY_URL", ""),
     )
 
 
