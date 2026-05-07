@@ -7,6 +7,7 @@ anti-bot. Đánh đổi: phụ thuộc service bên ngoài (~1 req/s rate limit)
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
 import urllib.error
@@ -110,8 +111,9 @@ def _tikwm_query(url: str, proxy_url: str | None) -> dict:
             return data
 
         msg = payload.get("msg") or "unknown tikwm error"
-        # "Url parsing is failed" → video private/đã xoá. Không retry.
+        log.warning("tikwm error code=%s msg=%r url=%s", payload.get("code"), msg, url)
         # "Free Api Limit" / rate limit → retry.
+        # "Url parsing is failed" / video private → fail nhanh, không retry.
         if _is_rate_limit_message(msg) and attempt < 2:
             last_error_msg = msg
             continue
@@ -131,13 +133,60 @@ def _http_download(video_url: str, dest: Path, proxy_url: str | None) -> None:
         raise DownloadError(f"video download failed: {exc}") from exc
 
 
+_DOUYIN_HOST_RE = re.compile(
+    r"^https?://(?:www\.)?(?:douyin\.com|iesdouyin\.com)/", re.IGNORECASE
+)
+_DOUYIN_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)", re.IGNORECASE)
+
+
+def _generate_url_variants(url: str) -> list[str]:
+    """Tạo các format URL thay thế cho Douyin để thử với tikwm khi format
+    đầu tiên fail. TikTok và short link v.douyin.com không có biến thể."""
+    variants = [url]
+    if not _DOUYIN_HOST_RE.match(url):
+        return variants
+    m = _DOUYIN_ID_RE.search(url)
+    if not m:
+        return variants
+    video_id = m.group(1)
+    for alt in (
+        f"https://www.iesdouyin.com/share/video/{video_id}/",
+        f"https://www.douyin.com/video/{video_id}",
+        f"https://www.douyin.com/share/video/{video_id}",
+    ):
+        if alt != url and alt not in variants:
+            variants.append(alt)
+    return variants
+
+
+def _query_tikwm_with_fallback(url: str, proxy_url: str | None) -> dict:
+    """Thử tuần tự nhiều URL format. Fail nhanh nếu rate limit (đã retry
+    bên trong _tikwm_query). Chỉ retry với format khác khi tikwm bảo
+    'url parsing is failed' / không nhận dạng được URL."""
+    variants = _generate_url_variants(url)
+    last_exc: DownloadError | None = None
+    for idx, variant in enumerate(variants):
+        try:
+            if idx > 0:
+                log.info("Retry tikwm với URL variant: %s", variant)
+            return _tikwm_query(variant, proxy_url)
+        except DownloadError as exc:
+            err_lower = str(exc).lower()
+            if "url parsing" in err_lower or "not found" in err_lower or "invalid url" in err_lower:
+                last_exc = exc
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 def _download_sync(
     url: str,
     download_dir: Path,
     max_filesize_mb: int,
     proxy_url: str | None,
 ) -> DownloadResult:
-    info = _tikwm_query(url, proxy_url)
+    info = _query_tikwm_with_fallback(url, proxy_url)
 
     # hdplay = HD không watermark, play = SD không watermark.
     video_url = info.get("hdplay") or info.get("play")

@@ -37,6 +37,16 @@ _MODAL_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Regex để extract video ID từ các URL douyin.com/<path>/<id>.
+_DOUYIN_VIDEO_ID_RE = re.compile(
+    r"^https?://(?:www\.)?douyin\.com/(?:video|share/video|note)/(\d+)",
+    re.IGNORECASE,
+)
+_IESDOUYIN_VIDEO_ID_RE = re.compile(
+    r"^https?://(?:www\.)?iesdouyin\.com/share/(?:video|note)/(\d+)",
+    re.IGNORECASE,
+)
+
 _PATTERNS: list[tuple[re.Pattern[str], UrlKind]] = [
     (re.compile(r"^https?://v\.douyin\.com/[\w-]+/?", re.IGNORECASE), UrlKind.DOUYIN_VIDEO),
     (
@@ -70,13 +80,22 @@ _PATTERNS: list[tuple[re.Pattern[str], UrlKind]] = [
 ]
 
 
-def _canonicalize(url: str, kind: UrlKind) -> str:
-    """yt-dlp không nhận URL dạng douyin.com/jingxuan?modal_id=ID — rewrite
-    về douyin.com/video/ID để extractor xử lý được."""
-    if kind == UrlKind.DOUYIN_VIDEO:
-        m = _MODAL_ID_RE.match(url)
+def _extract_douyin_video_id(url: str) -> str | None:
+    for pattern in (_DOUYIN_VIDEO_ID_RE, _IESDOUYIN_VIDEO_ID_RE, _MODAL_ID_RE):
+        m = pattern.match(url)
         if m:
-            return f"https://www.douyin.com/video/{m.group(1)}"
+            return m.group(1)
+    return None
+
+
+def _canonicalize(url: str, kind: UrlKind) -> str:
+    """Rewrite về dạng iesdouyin.com/share/video/<id>/ — đây là URL share
+    chuẩn của Douyin, được tikwm.com cùng nhiều downloader khác support
+    rộng rãi hơn so với douyin.com/video/<id>."""
+    if kind == UrlKind.DOUYIN_VIDEO:
+        video_id = _extract_douyin_video_id(url)
+        if video_id:
+            return f"https://www.iesdouyin.com/share/video/{video_id}/"
     return url
 
 
