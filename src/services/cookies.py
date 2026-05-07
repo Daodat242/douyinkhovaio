@@ -21,7 +21,7 @@ def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
         cleaned += "=" * padding
 
     try:
-        decoded = base64.b64decode(cleaned, validate=False).decode("utf-8")
+        decoded_bytes = base64.b64decode(cleaned, validate=False)
     except Exception as exc:
         log.error(
             "Failed to decode DOUYIN_COOKIES_B64 (len=%d): %s",
@@ -31,7 +31,7 @@ def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
         return None
 
     Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(target_path).write_text(decoded, encoding="utf-8")
+    Path(target_path).write_bytes(decoded_bytes)
     os.chmod(target_path, 0o600)
-    log.info("Wrote Douyin cookies to %s (%d bytes)", target_path, len(decoded))
+    log.info("Wrote Douyin cookies to %s (%d bytes)", target_path, len(decoded_bytes))
     return target_path
