@@ -30,8 +30,32 @@ def write_cookies_from_env(b64_content: str, target_path: str) -> str | None:
         )
         return None
 
+    # yt-dlp đọc cookie file giả định encoding là UTF-8 của hệ điều hành.
+    # Cookie extension trên Windows hay export thành cp1252 / latin-1.
+    # Decode với fallback chain rồi re-encode về UTF-8 để yt-dlp đọc được.
+    text: str | None = None
+    used_encoding: str | None = None
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            text = decoded_bytes.decode(encoding)
+            used_encoding = encoding
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if text is None:
+        log.error("Could not decode cookie bytes with any encoding")
+        return None
+
+    if used_encoding != "utf-8":
+        log.info("Cookie source encoding was %s, converted to UTF-8", used_encoding)
+
     Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(target_path).write_bytes(decoded_bytes)
+    Path(target_path).write_text(text, encoding="utf-8")
     os.chmod(target_path, 0o600)
-    log.info("Wrote Douyin cookies to %s (%d bytes)", target_path, len(decoded_bytes))
+    log.info(
+        "Wrote Douyin cookies to %s (%d bytes UTF-8)",
+        target_path,
+        len(text.encode("utf-8")),
+    )
     return target_path
