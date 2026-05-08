@@ -1,12 +1,18 @@
-"""Video downloader sử dụng tikwm.com API.
+"""Video downloader với multi-provider fallback chain.
 
-Hỗ trợ Douyin và TikTok không watermark, không cần cookies hoặc xử lý
-anti-bot. Đánh đổi: phụ thuộc service bên ngoài (~1 req/s rate limit).
+Provider 1: api.douyin.wtf (Evil0ctal/Douyin_TikTok_Download_API) — chuyên
+            cho Douyin/TikTok, code mature. Có thể self-host qua
+            DOUYIN_WTF_ENDPOINT để bỏ rate limit demo.
+Provider 2: tikwm.com — free, không cần auth. Backup khi douyin.wtf down.
+
+Mỗi provider được thử tuần tự với nhiều URL variants (chỉ cho Douyin).
+First success = trả về luôn. Tất cả fail = raise error cuối cùng.
 """
 
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -16,6 +22,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +54,22 @@ class DownloadResult:
     info: VideoInfo
 
 
+@dataclass
+class _VideoMeta:
+    """Internal: metadata từ provider, normalize trước khi tải."""
+    video_url: str
+    title: str
+    uploader: str
+    duration: int
+    filesize_bytes: int | None
+    thumbnail: str | None
+    video_id: str
+
+
+# Default = demo của Evil0ctal. Self-host: set DOUYIN_WTF_ENDPOINT=http://my-host
+_DOUYIN_WTF_BASE = os.getenv("DOUYIN_WTF_ENDPOINT", "https://api.douyin.wtf").rstrip("/")
 _TIKWM_ENDPOINT = "https://www.tikwm.com/api/"
+
 _REQUEST_TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 120
 _USER_AGENT = (
@@ -66,72 +88,121 @@ def _build_opener(proxy_url: str | None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
-def _is_rate_limit_message(msg: str) -> bool:
-    msg_lower = msg.lower()
-    return any(kw in msg_lower for kw in ("rate limit", "limit", "free api", "too many"))
-
-
-def _tikwm_query(url: str, proxy_url: str | None) -> dict:
-    """Gọi tikwm API, trả về dict 'data' từ response.
-
-    Retry tối đa 2 lần khi rate limit (free tier ~1 req/s).
-    """
-    params = urllib.parse.urlencode({"url": url, "hd": "1"})
-    full_url = f"{_TIKWM_ENDPOINT}?{params}"
+def _http_get_json(full_url: str, proxy_url: str | None) -> dict:
     req = urllib.request.Request(
         full_url,
         headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
     )
     opener = _build_opener(proxy_url)
+    try:
+        with opener.open(req, timeout=_REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise DownloadError(f"HTTP {exc.code}: {exc.reason}") from exc
+    except Exception as exc:
+        raise DownloadError(f"request failed: {exc}") from exc
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise DownloadError(f"non-JSON response: {body[:200]}") from exc
 
-    last_error_msg = ""
+
+def _fetch_via_douyin_wtf(url: str, proxy_url: str | None) -> _VideoMeta:
+    full_url = (
+        f"{_DOUYIN_WTF_BASE}/api/hybrid/video_data?"
+        + urllib.parse.urlencode({"url": url, "minimal": "false"})
+    )
+    payload = _http_get_json(full_url, proxy_url)
+
+    code = payload.get("code")
+    if code != 200:
+        msg = payload.get("message") or payload.get("msg") or f"code={code}"
+        raise DownloadError(f"douyin.wtf: {msg}")
+
+    data = payload.get("data") or {}
+    if data.get("type") != "video":
+        raise DownloadError(
+            f"douyin.wtf: chỉ hỗ trợ video, type={data.get('type')}"
+        )
+
+    video_data = data.get("video_data") or {}
+    video_url = video_data.get("nwm_video_url_HQ") or video_data.get("nwm_video_url")
+    if not video_url:
+        raise DownloadError("douyin.wtf: response không có nwm_video_url")
+
+    author = data.get("author") or {}
+    cover_data = data.get("cover_data") or {}
+
+    return _VideoMeta(
+        video_url=video_url,
+        title=(data.get("desc") or "video").strip()[:200],
+        uploader=(
+            author.get("nickname") or author.get("unique_id") or "unknown"
+        ),
+        duration=int(data.get("duration") or 0),
+        filesize_bytes=None,  # douyin.wtf không trả size đáng tin
+        thumbnail=cover_data.get("origin_cover") or cover_data.get("cover"),
+        video_id=str(data.get("video_id") or ""),
+    )
+
+
+def _is_rate_limit_message(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return any(kw in msg_lower for kw in ("rate limit", "limit", "free api", "too many"))
+
+
+def _fetch_via_tikwm(url: str, proxy_url: str | None) -> _VideoMeta:
+    last_msg = ""
     for attempt in range(3):
         if attempt > 0:
             time.sleep(1.5)
+        full_url = (
+            _TIKWM_ENDPOINT
+            + "?"
+            + urllib.parse.urlencode({"url": url, "hd": "1"})
+        )
         try:
-            with opener.open(req, timeout=_REQUEST_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429 and attempt < 2:
-                last_error_msg = "HTTP 429 rate limit"
+            payload = _http_get_json(full_url, proxy_url)
+        except DownloadError as exc:
+            if "429" in str(exc) and attempt < 2:
+                last_msg = "HTTP 429"
                 continue
-            raise DownloadError(f"tikwm HTTP {exc.code}: {exc.reason}") from exc
-        except Exception as exc:
-            raise DownloadError(f"tikwm request failed: {exc}") from exc
-
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise DownloadError(f"tikwm returned non-JSON: {body[:200]}") from exc
+            raise
 
         if payload.get("code") == 0:
             data = payload.get("data")
             if not isinstance(data, dict):
                 raise DownloadError("tikwm response missing 'data'")
-            return data
+            video_url = data.get("hdplay") or data.get("play")
+            if not video_url:
+                raise DownloadError("tikwm: response không có video URL")
+            author = data.get("author") or {}
+            return _VideoMeta(
+                video_url=video_url,
+                title=(data.get("title") or "video").strip()[:200],
+                uploader=(
+                    author.get("nickname") or author.get("unique_id") or "unknown"
+                ),
+                duration=int(data.get("duration") or 0),
+                filesize_bytes=data.get("hd_size") or data.get("size"),
+                thumbnail=data.get("cover") or data.get("origin_cover"),
+                video_id=str(data.get("id") or ""),
+            )
 
         msg = payload.get("msg") or "unknown tikwm error"
-        log.warning("tikwm error code=%s msg=%r url=%s", payload.get("code"), msg, url)
-        # "Free Api Limit" / rate limit → retry.
-        # "Url parsing is failed" / video private → fail nhanh, không retry.
+        log.warning("tikwm error msg=%r url=%s", msg, url)
         if _is_rate_limit_message(msg) and attempt < 2:
-            last_error_msg = msg
+            last_msg = msg
             continue
         raise DownloadError(f"tikwm: {msg}")
 
-    raise DownloadError(f"tikwm: rate limited sau 3 lần thử ({last_error_msg})")
+    raise DownloadError(f"tikwm: rate limited sau 3 lần thử ({last_msg})")
 
 
-def _http_download(video_url: str, dest: Path, proxy_url: str | None) -> None:
-    req = urllib.request.Request(video_url, headers={"User-Agent": _USER_AGENT})
-    opener = _build_opener(proxy_url)
-    try:
-        with opener.open(req, timeout=_DOWNLOAD_TIMEOUT) as resp:
-            with dest.open("wb") as f:
-                shutil.copyfileobj(resp, f, length=64 * 1024)
-    except Exception as exc:
-        raise DownloadError(f"video download failed: {exc}") from exc
-
+_PROVIDERS: list[tuple[str, Callable[[str, str | None], _VideoMeta]]] = [
+    ("douyin.wtf", _fetch_via_douyin_wtf),
+    ("tikwm.com", _fetch_via_tikwm),
+]
 
 _DOUYIN_HOST_RE = re.compile(
     r"^https?://(?:www\.)?(?:douyin\.com|iesdouyin\.com)/", re.IGNORECASE
@@ -140,8 +211,7 @@ _DOUYIN_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)", re.IGNORECASE)
 
 
 def _generate_url_variants(url: str) -> list[str]:
-    """Tạo các format URL thay thế cho Douyin để thử với tikwm khi format
-    đầu tiên fail. TikTok và short link v.douyin.com không có biến thể."""
+    """Tạo URL variants cho Douyin (TikTok và short link không cần)."""
     variants = [url]
     if not _DOUYIN_HOST_RE.match(url):
         return variants
@@ -159,25 +229,73 @@ def _generate_url_variants(url: str) -> list[str]:
     return variants
 
 
-def _query_tikwm_with_fallback(url: str, proxy_url: str | None) -> dict:
-    """Thử tuần tự nhiều URL format. Fail nhanh nếu rate limit (đã retry
-    bên trong _tikwm_query). Chỉ retry với format khác khi tikwm bảo
-    'url parsing is failed' / không nhận dạng được URL."""
+def _is_url_format_error(exc: DownloadError) -> bool:
+    """Lỗi do URL format không hợp lệ → đáng thử variant khác."""
+    err = str(exc).lower()
+    return any(
+        kw in err for kw in ("url parsing", "not found", "invalid url", "404")
+    )
+
+
+def _fetch_meta(url: str, proxy_url: str | None) -> _VideoMeta:
+    """Thử [provider × URL variant] tuần tự, trả về first success.
+
+    Strategy: với mỗi provider, thử tất cả variants. Nếu provider chết
+    hoàn toàn (network/HTTP error), skip sang provider tiếp theo. Chỉ
+    raise nếu tất cả providers × variants đều fail.
+    """
     variants = _generate_url_variants(url)
     last_exc: DownloadError | None = None
-    for idx, variant in enumerate(variants):
-        try:
-            if idx > 0:
-                log.info("Retry tikwm với URL variant: %s", variant)
-            return _tikwm_query(variant, proxy_url)
-        except DownloadError as exc:
-            err_lower = str(exc).lower()
-            if "url parsing" in err_lower or "not found" in err_lower or "invalid url" in err_lower:
+
+    for provider_name, fetcher in _PROVIDERS:
+        for variant in variants:
+            try:
+                meta = fetcher(variant, proxy_url)
+                log.info(
+                    "Provider=%s thành công (URL=%s, video_id=%s)",
+                    provider_name,
+                    variant,
+                    meta.video_id,
+                )
+                return meta
+            except DownloadError as exc:
                 last_exc = exc
-                continue
-            raise
-    assert last_exc is not None
+                if _is_url_format_error(exc):
+                    log.info(
+                        "Provider=%s reject URL=%s (%s) — thử variant tiếp",
+                        provider_name,
+                        variant,
+                        exc,
+                    )
+                    continue
+                # Provider down hẳn → bỏ qua các variant còn lại
+                log.warning(
+                    "Provider=%s lỗi không phải URL format: %s — skip provider",
+                    provider_name,
+                    exc,
+                )
+                break
+
+    assert last_exc is not None, "_PROVIDERS không thể rỗng"
     raise last_exc
+
+
+def _http_download(video_url: str, dest: Path, proxy_url: str | None) -> None:
+    req = urllib.request.Request(
+        video_url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            # Douyin CDN đôi khi check Referer.
+            "Referer": "https://www.douyin.com/",
+        },
+    )
+    opener = _build_opener(proxy_url)
+    try:
+        with opener.open(req, timeout=_DOWNLOAD_TIMEOUT) as resp:
+            with dest.open("wb") as f:
+                shutil.copyfileobj(resp, f, length=64 * 1024)
+    except Exception as exc:
+        raise DownloadError(f"video download failed: {exc}") from exc
 
 
 def _download_sync(
@@ -186,16 +304,10 @@ def _download_sync(
     max_filesize_mb: int,
     proxy_url: str | None,
 ) -> DownloadResult:
-    info = _query_tikwm_with_fallback(url, proxy_url)
+    meta = _fetch_meta(url, proxy_url)
 
-    # hdplay = HD không watermark, play = SD không watermark.
-    video_url = info.get("hdplay") or info.get("play")
-    if not video_url:
-        raise DownloadError("tikwm: response không có video URL")
-
-    declared_size_bytes = info.get("size") or info.get("hd_size")
-    if declared_size_bytes:
-        declared_mb = declared_size_bytes / 1024 / 1024
+    if meta.filesize_bytes:
+        declared_mb = meta.filesize_bytes / 1024 / 1024
         if declared_mb > max_filesize_mb:
             raise TooLargeError(declared_mb, max_filesize_mb)
 
@@ -203,11 +315,11 @@ def _download_sync(
     job_dir = download_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    video_id = str(info.get("id") or job_id)
+    video_id = meta.video_id or job_id
     filepath = job_dir / f"{video_id}.mp4"
 
     try:
-        _http_download(video_url, filepath, proxy_url)
+        _http_download(meta.video_url, filepath, proxy_url)
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
@@ -217,18 +329,15 @@ def _download_sync(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise TooLargeError(size_mb, max_filesize_mb)
 
-    author = info.get("author") or {}
-    video_info = VideoInfo(
+    info = VideoInfo(
         url=url,
-        title=(info.get("title") or "video").strip()[:200],
-        uploader=(
-            author.get("nickname") or author.get("unique_id") or "unknown"
-        ),
-        duration=int(info.get("duration") or 0),
+        title=meta.title,
+        uploader=meta.uploader,
+        duration=meta.duration,
         filesize_mb=size_mb,
-        thumbnail=info.get("cover") or info.get("origin_cover"),
+        thumbnail=meta.thumbnail,
     )
-    return DownloadResult(filepath=filepath, info=video_info)
+    return DownloadResult(filepath=filepath, info=info)
 
 
 async def download(
