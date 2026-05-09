@@ -148,7 +148,18 @@ def _fetch_via_douyin_wtf(url: str, proxy_url: str | None) -> _VideoMeta:
 
 def _is_rate_limit_message(msg: str) -> bool:
     msg_lower = msg.lower()
-    return any(kw in msg_lower for kw in ("rate limit", "limit", "free api", "too many"))
+    # Patterns chính xác — không match "limit" trần (sẽ trùng "filesize limit",
+    # "duration limit"...).
+    return any(
+        kw in msg_lower
+        for kw in (
+            "rate limit",
+            "free api limit",
+            "too many requests",
+            "too many",
+            "请求过于频繁",  # tiếng Trung
+        )
+    )
 
 
 def _fetch_via_tikwm(url: str, proxy_url: str | None) -> _VideoMeta:
@@ -164,7 +175,8 @@ def _fetch_via_tikwm(url: str, proxy_url: str | None) -> _VideoMeta:
         try:
             payload = _http_get_json(full_url, proxy_url)
         except DownloadError as exc:
-            if "429" in str(exc) and attempt < 2:
+            # _http_get_json format: "HTTP 429: Too Many Requests"
+            if "HTTP 429" in str(exc) and attempt < 2:
                 last_msg = "HTTP 429"
                 continue
             raise

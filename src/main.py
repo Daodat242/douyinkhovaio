@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from src.config import settings
 from src.handlers import start as start_handler
 from src.handlers import video as video_handler
+from src.services import downloader
 from src.services.cache import FileCache
 from src.services.ratelimit import RateLimiter
 
@@ -70,8 +71,18 @@ async def _run() -> None:
     _configure_logging()
     _prepare_filesystem()
 
+    log.info(
+        "Provider chain: %s",
+        " → ".join(name for name, _ in downloader._PROVIDERS),
+    )
+    log.info("douyin.wtf endpoint: %s", downloader._DOUYIN_WTF_BASE)
+    if downloader._DOUYIN_WTF_BASE == "https://api.douyin.wtf":
+        log.warning(
+            "Đang dùng public demo api.douyin.wtf — README ghi 'fragile'. "
+            "Self-host và set DOUYIN_WTF_ENDPOINT để stable."
+        )
     if settings.proxy_url:
-        log.info("Routing tikwm requests via proxy: %s", _redact_proxy(settings.proxy_url))
+        log.info("Routing requests via proxy: %s", _redact_proxy(settings.proxy_url))
 
     redis_client = await _connect_redis_with_retry(settings.redis_url)
 
